@@ -20,8 +20,8 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 BASE_URL = "https://vgek43.ru"
 DEFAULT_GROUP = "Д-12"
 
-# На Render/BotHost лучше добавить PROXY_URL в переменные окружения.
 # Если PROXY_URL пустой — бот работает без прокси.
+# На хостинге обычно прокси не нужен.
 PROXY_URL = os.getenv("PROXY_URL", "").strip()
 
 REQUEST_PROXIES = None
@@ -39,8 +39,6 @@ MAIN_KEYBOARD = ReplyKeyboardMarkup(
     resize_keyboard=True
 )
 
-# Тут храним сообщения бота, которые надо удалить при следующем действии.
-# После перезапуска хостинга память очищается — это нормально.
 LAST_MESSAGES_BY_CHAT = {}
 
 logging.basicConfig(
@@ -54,11 +52,7 @@ logging.basicConfig(
 # ==========================
 
 async def delete_old_bot_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Удаляет прошлые сообщения бота в конкретном чате.
-    """
     chat_id = update.effective_chat.id
-
     old_message_ids = LAST_MESSAGES_BY_CHAT.get(chat_id, [])
 
     for message_id in old_message_ids:
@@ -74,10 +68,6 @@ async def delete_old_bot_messages(update: Update, context: ContextTypes.DEFAULT_
 
 
 async def delete_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Пытается удалить команду/нажатие пользователя, чтобы чат был чище.
-    Если Telegram не даст удалить — просто игнорируем.
-    """
     if not update.message:
         return
 
@@ -92,18 +82,16 @@ async def delete_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 async def send_tracked_message(
     update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
     text: str,
     parse_mode: str | None = None,
     reply_markup=None
 ):
-    """
-    Отправляет сообщение и запоминает его id,
-    чтобы потом удалить при следующем действии.
-    """
     chat_id = update.effective_chat.id
 
-    message = await update.message.reply_text(
-        text,
+    message = await context.bot.send_message(
+        chat_id=chat_id,
+        text=text,
         parse_mode=parse_mode,
         reply_markup=reply_markup
     )
@@ -114,9 +102,6 @@ async def send_tracked_message(
 
 
 async def prepare_clean_response(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Перед новым ответом чистим старый вывод.
-    """
     await delete_old_bot_messages(update, context)
     await delete_user_message(update, context)
 
@@ -256,6 +241,15 @@ def get_day_time_range(day) -> str:
 
 def count_day_lessons(day) -> int:
     return len(day.get("lessons", []))
+
+
+def get_updated_line(schedule_data) -> str:
+    updated = schedule_data.get("updated", "")
+
+    if not updated:
+        return "🕒 Время обновления не найдено"
+
+    return f"🕒 {escape_html_text(updated)}"
 
 
 # ==========================
@@ -511,11 +505,13 @@ def format_day_by_offset(schedule_data, offset: int) -> str:
             else:
                 prefix = f"📌 <b>{target_str}</b>"
 
+            updated_line = get_updated_line(schedule_data)
             day_text = format_day_detailed(day, show_empty=True)
 
-            return limit_message(f"{prefix}\n\n{day_text}")
+            return limit_message(f"{prefix}\n{updated_line}\n\n{day_text}")
 
-    return f"Не нашёл расписание на {target_str}."
+    updated_line = get_updated_line(schedule_data)
+    return f"{updated_line}\n\nНе нашёл расписание на {target_str}."
 
 
 # ==========================
@@ -553,10 +549,6 @@ def get_relevant_week_days(schedule_data):
 
 
 def get_main_subjects_for_day(day) -> list[str]:
-    """
-    Для недельного обзора берём только названия предметов.
-    Без кабинетов, без преподов — чтобы не было спама.
-    """
     subjects = []
 
     for lesson in day.get("lessons", []):
@@ -581,10 +573,6 @@ def shorten_subject(subject: str) -> str:
 
 
 def compact_subjects_line(subjects: list[str]) -> str:
-    """
-    Склеивает предметы в короткий вид:
-    Русский ×2, Литература, Математика
-    """
     counts = {}
 
     for subject in subjects:
@@ -643,10 +631,8 @@ def format_week(schedule_data):
 
     lines = [
         f"📅 <b>Ближайшая неделя · {escape_html_text(schedule_data['group'])}</b>",
+        get_updated_line(schedule_data),
     ]
-
-    if schedule_data["updated"]:
-        lines.append(f"🕒 {escape_html_text(schedule_data['updated'])}")
 
     lines.append("")
 
@@ -717,6 +703,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await send_tracked_message(
         update,
+        context,
         "Бот живой ✅\n\n"
         "Выбери кнопку ниже:\n\n"
         "📌 Сегодня — подробное расписание\n"
@@ -733,6 +720,7 @@ async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await send_tracked_message(
         update,
+        context,
         "pong ✅",
         reply_markup=MAIN_KEYBOARD
     )
@@ -743,6 +731,7 @@ async def today(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     loading = await send_tracked_message(
         update,
+        context,
         "Загружаю сегодня…",
         reply_markup=MAIN_KEYBOARD
     )
@@ -764,6 +753,7 @@ async def today(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await send_tracked_message(
         update,
+        context,
         result,
         parse_mode="HTML",
         reply_markup=MAIN_KEYBOARD
@@ -775,6 +765,7 @@ async def tomorrow(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     loading = await send_tracked_message(
         update,
+        context,
         "Загружаю завтра…",
         reply_markup=MAIN_KEYBOARD
     )
@@ -796,6 +787,7 @@ async def tomorrow(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await send_tracked_message(
         update,
+        context,
         result,
         parse_mode="HTML",
         reply_markup=MAIN_KEYBOARD
@@ -807,6 +799,7 @@ async def week(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     loading = await send_tracked_message(
         update,
+        context,
         "Собираю краткий обзор недели…",
         reply_markup=MAIN_KEYBOARD
     )
@@ -829,6 +822,7 @@ async def week(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for message in messages:
         await send_tracked_message(
             update,
+            context,
             message,
             parse_mode="HTML",
             reply_markup=MAIN_KEYBOARD
@@ -841,6 +835,7 @@ async def group(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         await send_tracked_message(
             update,
+            context,
             "Напиши группу после команды. Например:\n/group Д-12",
             reply_markup=MAIN_KEYBOARD
         )
@@ -850,6 +845,7 @@ async def group(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     loading = await send_tracked_message(
         update,
+        context,
         f"Ищу расписание группы {group_name}…",
         reply_markup=MAIN_KEYBOARD
     )
@@ -872,6 +868,7 @@ async def group(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for message in messages:
         await send_tracked_message(
             update,
+            context,
             message,
             parse_mode="HTML",
             reply_markup=MAIN_KEYBOARD
@@ -901,6 +898,7 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await send_tracked_message(
         update,
+        context,
         "Не понял сообщение. Используй кнопки ниже 👇",
         reply_markup=MAIN_KEYBOARD
     )
