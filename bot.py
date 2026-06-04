@@ -20,13 +20,16 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 BASE_URL = "https://vgek43.ru"
 DEFAULT_GROUP = "Д-12"
 
-# Твой рабочий HTTP-прокси
-PROXY_URL = "http://hW5fiTZE:Yiq5KNNt@130.49.81.142:63446"
+# На Render/BotHost лучше добавить PROXY_URL в переменные окружения.
+# Если PROXY_URL пустой — бот работает без прокси.
+PROXY_URL = os.getenv("PROXY_URL", "").strip()
 
-REQUEST_PROXIES = {
-    "http": PROXY_URL,
-    "https": PROXY_URL,
-}
+REQUEST_PROXIES = None
+if PROXY_URL:
+    REQUEST_PROXIES = {
+        "http": PROXY_URL,
+        "https": PROXY_URL,
+    }
 
 MAIN_KEYBOARD = ReplyKeyboardMarkup(
     [
@@ -36,10 +39,86 @@ MAIN_KEYBOARD = ReplyKeyboardMarkup(
     resize_keyboard=True
 )
 
+# Тут храним сообщения бота, которые надо удалить при следующем действии.
+# После перезапуска хостинга память очищается — это нормально.
+LAST_MESSAGES_BY_CHAT = {}
+
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
 )
+
+
+# ==========================
+# ОЧИСТКА ЧАТА
+# ==========================
+
+async def delete_old_bot_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Удаляет прошлые сообщения бота в конкретном чате.
+    """
+    chat_id = update.effective_chat.id
+
+    old_message_ids = LAST_MESSAGES_BY_CHAT.get(chat_id, [])
+
+    for message_id in old_message_ids:
+        try:
+            await context.bot.delete_message(
+                chat_id=chat_id,
+                message_id=message_id
+            )
+        except Exception:
+            pass
+
+    LAST_MESSAGES_BY_CHAT[chat_id] = []
+
+
+async def delete_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Пытается удалить команду/нажатие пользователя, чтобы чат был чище.
+    Если Telegram не даст удалить — просто игнорируем.
+    """
+    if not update.message:
+        return
+
+    try:
+        await context.bot.delete_message(
+            chat_id=update.effective_chat.id,
+            message_id=update.message.message_id
+        )
+    except Exception:
+        pass
+
+
+async def send_tracked_message(
+    update: Update,
+    text: str,
+    parse_mode: str | None = None,
+    reply_markup=None
+):
+    """
+    Отправляет сообщение и запоминает его id,
+    чтобы потом удалить при следующем действии.
+    """
+    chat_id = update.effective_chat.id
+
+    message = await update.message.reply_text(
+        text,
+        parse_mode=parse_mode,
+        reply_markup=reply_markup
+    )
+
+    LAST_MESSAGES_BY_CHAT.setdefault(chat_id, []).append(message.message_id)
+
+    return message
+
+
+async def prepare_clean_response(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Перед новым ответом чистим старый вывод.
+    """
+    await delete_old_bot_messages(update, context)
+    await delete_user_message(update, context)
 
 
 # ==========================
@@ -139,9 +218,6 @@ def get_subject_icon(subject: str) -> str:
 
 
 def parse_time_range(time_text: str):
-    """
-    14.20-15.40 или 14:20–15:40 -> ('14:20', '15:40')
-    """
     if not time_text:
         return None
 
@@ -159,9 +235,6 @@ def parse_time_range(time_text: str):
 
 
 def get_day_time_range(day) -> str:
-    """
-    Возвращает общее время дня: 14:20–20:00
-    """
     starts = []
     ends = []
 
@@ -450,10 +523,6 @@ def format_day_by_offset(schedule_data, offset: int) -> str:
 # ==========================
 
 def get_relevant_week_days(schedule_data):
-    """
-    Берём только ближайшие 7 дней от сегодняшней даты.
-    Если сайт показывает не этот диапазон, берём первые 7 дней, где есть пары.
-    """
     today = datetime.now().date()
     week_end = today + timedelta(days=6)
 
@@ -483,37 +552,58 @@ def get_relevant_week_days(schedule_data):
     return fallback
 
 
-def get_compact_subjects_for_day(day) -> list[str]:
+def get_main_subjects_for_day(day) -> list[str]:
+    """
+    Для недельного обзора берём только названия предметов.
+    Без кабинетов, без преподов — чтобы не было спама.
+    """
     subjects = []
 
     for lesson in day.get("lessons", []):
-        lesson_number = lesson.get("number", "")
-        time_text = normalize_time(lesson.get("time", ""))
-
-        item_names = []
-
         for item in lesson.get("items", []):
             subject = item.get("subject", "")
-            room = item.get("room", "")
-            subgroup = item.get("subgroup")
 
-            if subgroup:
-                name = f"п/г {subgroup}: {subject}"
-            else:
-                name = subject
+            if not subject:
+                continue
 
-            if room:
-                name += f" · {room}"
-
-            item_names.append(name)
-
-        if not item_names:
-            continue
-
-        joined_items = " / ".join(item_names)
-        subjects.append(f"{lesson_number}) {time_text} — {joined_items}")
+            subjects.append(subject)
 
     return subjects
+
+
+def shorten_subject(subject: str) -> str:
+    subject = subject.replace("Консультация к экзамену по дисциплине", "Конс.")
+    subject = subject.replace("Диф.зач.", "Диф.зач.")
+    subject = subject.replace("Диф. зач.", "Диф.зач.")
+    subject = subject.replace("Основы ораторского искусства", "Ораторское")
+    subject = subject.replace("История мировой и отечественной культуры", "ИМК")
+    return subject.strip()
+
+
+def compact_subjects_line(subjects: list[str]) -> str:
+    """
+    Склеивает предметы в короткий вид:
+    Русский ×2, Литература, Математика
+    """
+    counts = {}
+
+    for subject in subjects:
+        subject = shorten_subject(subject)
+
+        if subject not in counts:
+            counts[subject] = 0
+
+        counts[subject] += 1
+
+    parts = []
+
+    for subject, count in counts.items():
+        if count > 1:
+            parts.append(f"{subject} ×{count}")
+        else:
+            parts.append(subject)
+
+    return ", ".join(parts)
 
 
 def format_week_day_compact(day) -> str:
@@ -526,8 +616,12 @@ def format_week_day_compact(day) -> str:
 
     total_time = get_day_time_range(day)
     lessons_count = count_day_lessons(day)
+    subjects = get_main_subjects_for_day(day)
+    subjects_line = compact_subjects_line(subjects)
 
-    header = f"<b>{weekday}{week_type} · {date_short}</b>"
+    lines = [
+        f"<b>{weekday}{week_type} · {date_short}</b>"
+    ]
 
     meta = []
 
@@ -536,22 +630,10 @@ def format_week_day_compact(day) -> str:
 
     meta.append(f"🔢 {lessons_count} пар.")
 
-    lines = [
-        header,
-        " · ".join(meta)
-    ]
+    lines.append(" · ".join(meta))
 
-    subjects = get_compact_subjects_for_day(day)
-
-    # Чтобы неделя не была спамом:
-    # показываем максимум 4 строки пар, если пар больше — сворачиваем хвост.
-    max_lines = 4
-
-    for subject_line in subjects[:max_lines]:
-        lines.append(escape_html_text(subject_line))
-
-    if len(subjects) > max_lines:
-        lines.append(f"…ещё {len(subjects) - max_lines} пар.")
+    if subjects_line:
+        lines.append(f"📚 {escape_html_text(subjects_line)}")
 
     return "\n".join(lines)
 
@@ -631,7 +713,10 @@ def split_long_message(text: str, limit: int = 3600):
 # ==========================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
+    await prepare_clean_response(update, context)
+
+    await send_tracked_message(
+        update,
         "Бот живой ✅\n\n"
         "Выбери кнопку ниже:\n\n"
         "📌 Сегодня — подробное расписание\n"
@@ -644,14 +729,20 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
+    await prepare_clean_response(update, context)
+
+    await send_tracked_message(
+        update,
         "pong ✅",
         reply_markup=MAIN_KEYBOARD
     )
 
 
 async def today(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
+    await prepare_clean_response(update, context)
+
+    loading = await send_tracked_message(
+        update,
         "Загружаю сегодня…",
         reply_markup=MAIN_KEYBOARD
     )
@@ -662,7 +753,17 @@ async def today(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as error:
         result = f"❌ Ошибка:\n{escape_html_text(error)}"
 
-    await update.message.reply_text(
+    try:
+        await context.bot.delete_message(
+            chat_id=update.effective_chat.id,
+            message_id=loading.message_id
+        )
+        LAST_MESSAGES_BY_CHAT[update.effective_chat.id].remove(loading.message_id)
+    except Exception:
+        pass
+
+    await send_tracked_message(
+        update,
         result,
         parse_mode="HTML",
         reply_markup=MAIN_KEYBOARD
@@ -670,7 +771,10 @@ async def today(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def tomorrow(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
+    await prepare_clean_response(update, context)
+
+    loading = await send_tracked_message(
+        update,
         "Загружаю завтра…",
         reply_markup=MAIN_KEYBOARD
     )
@@ -681,7 +785,17 @@ async def tomorrow(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as error:
         result = f"❌ Ошибка:\n{escape_html_text(error)}"
 
-    await update.message.reply_text(
+    try:
+        await context.bot.delete_message(
+            chat_id=update.effective_chat.id,
+            message_id=loading.message_id
+        )
+        LAST_MESSAGES_BY_CHAT[update.effective_chat.id].remove(loading.message_id)
+    except Exception:
+        pass
+
+    await send_tracked_message(
+        update,
         result,
         parse_mode="HTML",
         reply_markup=MAIN_KEYBOARD
@@ -689,7 +803,10 @@ async def tomorrow(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def week(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
+    await prepare_clean_response(update, context)
+
+    loading = await send_tracked_message(
+        update,
         "Собираю краткий обзор недели…",
         reply_markup=MAIN_KEYBOARD
     )
@@ -697,25 +814,33 @@ async def week(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         schedule = parse_group_schedule(DEFAULT_GROUP)
         messages = format_week(schedule)
-
-        for message in messages:
-            await update.message.reply_text(
-                message,
-                parse_mode="HTML",
-                reply_markup=MAIN_KEYBOARD
-            )
-
     except Exception as error:
-        await update.message.reply_text(
-            f"❌ Ошибка:\n{escape_html_text(error)}",
+        messages = [f"❌ Ошибка:\n{escape_html_text(error)}"]
+
+    try:
+        await context.bot.delete_message(
+            chat_id=update.effective_chat.id,
+            message_id=loading.message_id
+        )
+        LAST_MESSAGES_BY_CHAT[update.effective_chat.id].remove(loading.message_id)
+    except Exception:
+        pass
+
+    for message in messages:
+        await send_tracked_message(
+            update,
+            message,
             parse_mode="HTML",
             reply_markup=MAIN_KEYBOARD
         )
 
 
 async def group(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await prepare_clean_response(update, context)
+
     if not context.args:
-        await update.message.reply_text(
+        await send_tracked_message(
+            update,
             "Напиши группу после команды. Например:\n/group Д-12",
             reply_markup=MAIN_KEYBOARD
         )
@@ -723,7 +848,8 @@ async def group(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     group_name = " ".join(context.args).strip()
 
-    await update.message.reply_text(
+    loading = await send_tracked_message(
+        update,
         f"Ищу расписание группы {group_name}…",
         reply_markup=MAIN_KEYBOARD
     )
@@ -731,17 +857,22 @@ async def group(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         schedule = parse_group_schedule(group_name)
         messages = format_week(schedule)
-
-        for message in messages:
-            await update.message.reply_text(
-                message,
-                parse_mode="HTML",
-                reply_markup=MAIN_KEYBOARD
-            )
-
     except Exception as error:
-        await update.message.reply_text(
-            f"❌ Ошибка:\n{escape_html_text(error)}",
+        messages = [f"❌ Ошибка:\n{escape_html_text(error)}"]
+
+    try:
+        await context.bot.delete_message(
+            chat_id=update.effective_chat.id,
+            message_id=loading.message_id
+        )
+        LAST_MESSAGES_BY_CHAT[update.effective_chat.id].remove(loading.message_id)
+    except Exception:
+        pass
+
+    for message in messages:
+        await send_tracked_message(
+            update,
+            message,
             parse_mode="HTML",
             reply_markup=MAIN_KEYBOARD
         )
@@ -766,7 +897,10 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await today(update, context)
         return
 
-    await update.message.reply_text(
+    await prepare_clean_response(update, context)
+
+    await send_tracked_message(
+        update,
         "Не понял сообщение. Используй кнопки ниже 👇",
         reply_markup=MAIN_KEYBOARD
     )
@@ -783,17 +917,23 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
 
 def main():
     if not BOT_TOKEN:
-        print("ОШИБКА: BOT_TOKEN не найден в .env")
+        print("ОШИБКА: BOT_TOKEN не найден в переменных окружения")
         return
 
     print("Токен найден.")
     print("Запускаю бота...")
 
+    builder = Application.builder().token(BOT_TOKEN)
+
+    if PROXY_URL:
+        builder = (
+            builder
+            .proxy(PROXY_URL)
+            .get_updates_proxy(PROXY_URL)
+        )
+
     app = (
-        Application.builder()
-        .token(BOT_TOKEN)
-        .proxy(PROXY_URL)
-        .get_updates_proxy(PROXY_URL)
+        builder
         .connect_timeout(30)
         .read_timeout(30)
         .write_timeout(30)
