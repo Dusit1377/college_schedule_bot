@@ -9,8 +9,19 @@ from urllib.parse import urljoin
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 
-from telegram import Update, ReplyKeyboardMarkup
-from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+)
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    CallbackQueryHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
 
 
 load_dotenv()
@@ -20,8 +31,8 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 BASE_URL = "https://vgek43.ru"
 DEFAULT_GROUP = "Д-12"
 
-# Если PROXY_URL пустой — бот работает без прокси.
 # На хостинге обычно прокси не нужен.
+# Если нужен — добавь переменную окружения PROXY_URL.
 PROXY_URL = os.getenv("PROXY_URL", "").strip()
 
 REQUEST_PROXIES = None
@@ -30,14 +41,6 @@ if PROXY_URL:
         "http": PROXY_URL,
         "https": PROXY_URL,
     }
-
-MAIN_KEYBOARD = ReplyKeyboardMarkup(
-    [
-        ["📌 Сегодня", "➡️ Завтра"],
-        ["📅 Неделя", "🔄 Обновить"],
-    ],
-    resize_keyboard=True
-)
 
 LAST_MESSAGES_BY_CHAT = {}
 
@@ -48,7 +51,82 @@ logging.basicConfig(
 
 
 # ==========================
-# ОЧИСТКА ЧАТА
+# КЛАВИАТУРЫ
+# ==========================
+
+def main_keyboard():
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("📌 Сегодня", callback_data="today"),
+                InlineKeyboardButton("➡️ Завтра", callback_data="tomorrow"),
+            ],
+            [
+                InlineKeyboardButton("📅 Неделя", callback_data="week"),
+                InlineKeyboardButton("🔄 Обновить", callback_data="refresh"),
+            ],
+        ]
+    )
+
+
+def week_keyboard(days):
+    buttons = []
+
+    row = []
+
+    for day in days:
+        date_short = pretty_short_date(day["date"])
+        weekday = day["weekday"]
+
+        label = f"{weekday} {date_short}"
+
+        row.append(
+            InlineKeyboardButton(
+                label,
+                callback_data=f"day:{day['date']}"
+            )
+        )
+
+        if len(row) == 2:
+            buttons.append(row)
+            row = []
+
+    if row:
+        buttons.append(row)
+
+    buttons.append(
+        [
+            InlineKeyboardButton("📌 Сегодня", callback_data="today"),
+            InlineKeyboardButton("➡️ Завтра", callback_data="tomorrow"),
+        ]
+    )
+
+    buttons.append(
+        [
+            InlineKeyboardButton("🔄 Обновить", callback_data="refresh"),
+        ]
+    )
+
+    return InlineKeyboardMarkup(buttons)
+
+
+def day_keyboard():
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("📌 Сегодня", callback_data="today"),
+                InlineKeyboardButton("➡️ Завтра", callback_data="tomorrow"),
+            ],
+            [
+                InlineKeyboardButton("📅 Неделя", callback_data="week"),
+                InlineKeyboardButton("🔄 Обновить", callback_data="refresh"),
+            ],
+        ]
+    )
+
+
+# ==========================
+# ОТПРАВКА / РЕДАКТИРОВАНИЕ
 # ==========================
 
 async def delete_old_bot_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -80,30 +158,57 @@ async def delete_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         pass
 
 
-async def send_tracked_message(
+async def send_new_screen(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
     text: str,
-    parse_mode: str | None = None,
-    reply_markup=None
+    reply_markup=None,
+    parse_mode: str = "HTML",
 ):
     chat_id = update.effective_chat.id
+
+    await delete_old_bot_messages(update, context)
+    await delete_user_message(update, context)
 
     message = await context.bot.send_message(
         chat_id=chat_id,
         text=text,
         parse_mode=parse_mode,
-        reply_markup=reply_markup
+        reply_markup=reply_markup,
     )
 
-    LAST_MESSAGES_BY_CHAT.setdefault(chat_id, []).append(message.message_id)
+    LAST_MESSAGES_BY_CHAT[chat_id] = [message.message_id]
 
     return message
 
 
-async def prepare_clean_response(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await delete_old_bot_messages(update, context)
-    await delete_user_message(update, context)
+async def edit_screen(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    text: str,
+    reply_markup=None,
+    parse_mode: str = "HTML",
+):
+    query = update.callback_query
+
+    if query:
+        try:
+            await query.edit_message_text(
+                text=text,
+                parse_mode=parse_mode,
+                reply_markup=reply_markup,
+            )
+            return
+        except Exception:
+            pass
+
+    await send_new_screen(
+        update,
+        context,
+        text,
+        reply_markup=reply_markup,
+        parse_mode=parse_mode,
+    )
 
 
 # ==========================
@@ -164,6 +269,11 @@ def parse_date(date_text: str):
         return None
 
 
+def now_local_date():
+    # Киров / Москва: UTC+3.
+    return (datetime.utcnow() + timedelta(hours=3)).date()
+
+
 def pretty_short_date(date_text: str) -> str:
     parts = date_text.split(".")
     if len(parts) >= 2:
@@ -171,35 +281,49 @@ def pretty_short_date(date_text: str) -> str:
     return date_text
 
 
-def get_subject_icon(subject: str) -> str:
+def plural_lessons(count: int) -> str:
+    if count % 10 == 1 and count % 100 != 11:
+        return "пара"
+
+    if count % 10 in [2, 3, 4] and count % 100 not in [12, 13, 14]:
+        return "пары"
+
+    return "пар"
+
+
+def is_credit_or_exam(subject: str) -> bool:
     subject_lower = subject.lower()
+    return (
+        "зач" in subject_lower
+        or "экзамен" in subject_lower
+    )
 
-    if "зач" in subject_lower:
-        return "⚠️"
-    if "экзамен" in subject_lower:
-        return "🚨"
-    if "консультация" in subject_lower:
-        return "💬"
-    if "матем" in subject_lower:
-        return "🧮"
-    if "русский" in subject_lower:
-        return "📝"
-    if "литера" in subject_lower:
-        return "📖"
-    if "информ" in subject_lower:
-        return "💻"
-    if "иностран" in subject_lower or "англий" in subject_lower:
-        return "🇬🇧"
-    if "рисунок" in subject_lower:
-        return "🎨"
-    if "история" in subject_lower:
-        return "🏛"
-    if "общество" in subject_lower:
-        return "👥"
-    if "проект" in subject_lower:
-        return "📌"
 
-    return "📘"
+def is_consultation(subject: str) -> bool:
+    return "консультац" in subject.lower()
+
+
+def important_prefix(subject: str) -> str:
+    if "экзамен" in subject.lower():
+        return "🚨 "
+
+    if is_credit_or_exam(subject):
+        return "⚠️ "
+
+    if is_consultation(subject):
+        return "💬 "
+
+    return ""
+
+
+def shorten_subject(subject: str) -> str:
+    subject = subject.replace("Консультация к экзамену по дисциплине", "Конс.")
+    subject = subject.replace("Основы ораторского искусства", "Ораторское")
+    subject = subject.replace("История мировой и отечественной культуры", "ИМК")
+    subject = subject.replace("Диф. зач.", "Диф.зач.")
+    subject = subject.replace("Диф.зач.", "Диф.зач.")
+    subject = subject.strip()
+    return subject
 
 
 def parse_time_range(time_text: str):
@@ -250,6 +374,15 @@ def get_updated_line(schedule_data) -> str:
         return "🕒 Время обновления не найдено"
 
     return f"🕒 {escape_html_text(updated)}"
+
+
+def get_day_label(day) -> str:
+    week_type = ""
+
+    if day.get("week_type"):
+        week_type = f"-{day['week_type']}"
+
+    return f"{day['weekday']}{week_type}"
 
 
 # ==========================
@@ -423,23 +556,27 @@ def parse_group_schedule(group_name: str):
 
 
 # ==========================
-# ПОДРОБНЫЙ ВЫВОД ДНЯ
+# ДЕНЬ: ПОДРОБНЫЙ ВЫВОД
 # ==========================
 
 def format_lesson_item_detailed(item):
-    subject = escape_html_text(item.get("subject", ""))
+    subject = shorten_subject(item.get("subject", ""))
+    subject = escape_html_text(subject)
+
     room = escape_html_text(item.get("room", ""))
     teacher = escape_html_text(item.get("teacher", ""))
     subgroup = item.get("subgroup")
 
-    icon = get_subject_icon(subject)
+    prefix = important_prefix(subject)
 
     lines = []
 
+    subject_line = f"{prefix}<b>{subject}</b>"
+
     if subgroup:
-        lines.append(f"{icon} <b>Подгруппа {subgroup}: {subject}</b>")
-    else:
-        lines.append(f"{icon} <b>{subject}</b>")
+        subject_line += f" · п/г {subgroup}"
+
+    lines.append(subject_line)
 
     if room:
         lines.append(f"🏫 Кабинет: <b>{room}</b>")
@@ -450,38 +587,35 @@ def format_lesson_item_detailed(item):
     return lines
 
 
-def format_day_detailed(day, show_empty: bool = False) -> str:
-    date_full = day["date"]
-    weekday = day["weekday"]
-
-    week_type = ""
-    if day.get("week_type"):
-        week_type = f"-{day['week_type']}"
-
-    title = f"📍 <b>{date_full}</b> · {weekday}{week_type}"
-
-    if not day["lessons"]:
-        if show_empty:
-            return f"{title}\n\nПар нет 🎉"
-        return ""
+def format_day_detailed(schedule_data, day, title_prefix: str) -> str:
+    day_label = get_day_label(day)
 
     total_time = get_day_time_range(day)
     lessons_count = count_day_lessons(day)
 
-    lines = [title]
+    lines = [
+        f"{title_prefix}",
+        get_updated_line(schedule_data),
+        "",
+        f"📍 <b>{day['date']}</b> · {day_label}",
+    ]
 
     if total_time:
         lines.append(f"⏱ Общее время: <b>{total_time}</b>")
 
     lines.append(f"🔢 Пар: <b>{lessons_count}</b>")
 
+    if not day.get("lessons"):
+        lines.append("")
+        lines.append("Пар нет 🎉")
+        return "\n".join(lines)
+
     for lesson in day["lessons"]:
         time_text = normalize_time(lesson.get("time", ""))
 
         lines.append("")
         lines.append("━━━━━━━━━━━━━━")
-        lines.append(f"🔹 <b>{lesson['number']} пара</b>")
-        lines.append(f"⏰ {time_text}")
+        lines.append(f"🔹 <b>{lesson['number']} пара</b> · {time_text}")
 
         for index, item in enumerate(lesson["items"]):
             if index > 0:
@@ -492,34 +626,26 @@ def format_day_detailed(day, show_empty: bool = False) -> str:
     return "\n".join(lines)
 
 
-def format_day_by_offset(schedule_data, offset: int) -> str:
-    target_date = datetime.now().date() + timedelta(days=offset)
-    target_str = target_date.strftime("%d.%m.%Y")
-
+def find_day_by_date(schedule_data, date_str: str):
     for day in schedule_data["days"]:
-        if day["date"] == target_str:
-            if offset == 0:
-                prefix = "📌 <b>Сегодня</b>"
-            elif offset == 1:
-                prefix = "➡️ <b>Завтра</b>"
-            else:
-                prefix = f"📌 <b>{target_str}</b>"
+        if day["date"] == date_str:
+            return day
 
-            updated_line = get_updated_line(schedule_data)
-            day_text = format_day_detailed(day, show_empty=True)
+    return None
 
-            return limit_message(f"{prefix}\n{updated_line}\n\n{day_text}")
 
-    updated_line = get_updated_line(schedule_data)
-    return f"{updated_line}\n\nНе нашёл расписание на {target_str}."
+def get_day_by_offset(schedule_data, offset: int):
+    target_date = now_local_date() + timedelta(days=offset)
+    target_str = target_date.strftime("%d.%m.%Y")
+    return find_day_by_date(schedule_data, target_str), target_str
 
 
 # ==========================
-# КОМПАКТНАЯ НЕДЕЛЯ
+# НЕДЕЛЯ: ОБЗОР + КНОПКИ ДНЕЙ
 # ==========================
 
 def get_relevant_week_days(schedule_data):
-    today = datetime.now().date()
+    today = now_local_date()
     week_end = today + timedelta(days=6)
 
     result = []
@@ -530,377 +656,308 @@ def get_relevant_week_days(schedule_data):
         if not day_date:
             continue
 
-        if today <= day_date <= week_end and day.get("lessons"):
+        if today <= day_date <= week_end:
             result.append(day)
 
     if result:
         return result
 
-    fallback = []
-
-    for day in schedule_data["days"]:
-        if day.get("lessons"):
-            fallback.append(day)
-
-        if len(fallback) >= 7:
-            break
-
-    return fallback
+    return schedule_data["days"][:7]
 
 
-def get_main_subjects_for_day(day) -> list[str]:
-    subjects = []
+def get_day_flags(day):
+    has_credit = False
+    has_exam = False
+    has_consultation = False
 
     for lesson in day.get("lessons", []):
         for item in lesson.get("items", []):
-            subject = item.get("subject", "")
+            subject = item.get("subject", "").lower()
 
-            if not subject:
-                continue
+            if "экзамен" in subject:
+                has_exam = True
 
-            subjects.append(subject)
+            if "зач" in subject:
+                has_credit = True
 
-    return subjects
+            if "консультац" in subject:
+                has_consultation = True
+
+    flags = []
+
+    if has_exam:
+        flags.append("🚨 экзамен")
+
+    if has_credit:
+        flags.append("⚠️ зачёт")
+
+    if has_consultation:
+        flags.append("💬 консультация")
+
+    return flags
 
 
-def shorten_subject(subject: str) -> str:
-    subject = subject.replace("Консультация к экзамену по дисциплине", "Конс.")
-    subject = subject.replace("Диф.зач.", "Диф.зач.")
-    subject = subject.replace("Диф. зач.", "Диф.зач.")
-    subject = subject.replace("Основы ораторского искусства", "Ораторское")
-    subject = subject.replace("История мировой и отечественной культуры", "ИМК")
-    return subject.strip()
+def format_week_day_line(day) -> str:
+    date_short = pretty_short_date(day["date"])
+    day_label = get_day_label(day)
 
+    lessons_count = count_day_lessons(day)
 
-def compact_subjects_line(subjects: list[str]) -> str:
-    counts = {}
+    if lessons_count == 0:
+        return f"<b>{day_label} · {date_short}</b> — пар нет"
 
-    for subject in subjects:
-        subject = shorten_subject(subject)
-
-        if subject not in counts:
-            counts[subject] = 0
-
-        counts[subject] += 1
+    total_time = get_day_time_range(day)
+    flags = get_day_flags(day)
 
     parts = []
 
-    for subject, count in counts.items():
-        if count > 1:
-            parts.append(f"{subject} ×{count}")
-        else:
-            parts.append(subject)
-
-    return ", ".join(parts)
-
-
-def format_week_day_compact(day) -> str:
-    date_short = pretty_short_date(day["date"])
-    weekday = day["weekday"]
-
-    week_type = ""
-    if day.get("week_type"):
-        week_type = f"-{day['week_type']}"
-
-    total_time = get_day_time_range(day)
-    lessons_count = count_day_lessons(day)
-    subjects = get_main_subjects_for_day(day)
-    subjects_line = compact_subjects_line(subjects)
-
-    lines = [
-        f"<b>{weekday}{week_type} · {date_short}</b>"
-    ]
-
-    meta = []
-
     if total_time:
-        meta.append(f"⏱ {total_time}")
+        parts.append(total_time)
 
-    meta.append(f"🔢 {lessons_count} пар.")
+    parts.append(f"{lessons_count} {plural_lessons(lessons_count)}")
 
-    lines.append(" · ".join(meta))
+    if flags:
+        parts.append(", ".join(flags))
 
-    if subjects_line:
-        lines.append(f"📚 {escape_html_text(subjects_line)}")
-
-    return "\n".join(lines)
+    return f"<b>{day_label} · {date_short}</b> — " + " · ".join(parts)
 
 
-def format_week(schedule_data):
+def format_week_overview(schedule_data):
     days = get_relevant_week_days(schedule_data)
 
     lines = [
-        f"📅 <b>Ближайшая неделя · {escape_html_text(schedule_data['group'])}</b>",
+        f"📅 <b>Неделя · {escape_html_text(schedule_data['group'])}</b>",
         get_updated_line(schedule_data),
+        "",
     ]
 
-    lines.append("")
-
     if not days:
-        lines.append("На ближайшую неделю занятий не найдено.")
-        return ["\n".join(lines)]
+        lines.append("Расписание не найдено.")
+        return "\n".join(lines), []
 
+    first_day = pretty_short_date(days[0]["date"])
+    last_day = pretty_short_date(days[-1]["date"])
     total_lessons = sum(count_day_lessons(day) for day in days)
-    first_day = days[0]["date"]
-    last_day = days[-1]["date"]
 
     lines.append(f"Период: <b>{first_day} — {last_day}</b>")
-    lines.append(f"Всего пар: <b>{total_lessons}</b>")
+    lines.append(f"Всего: <b>{total_lessons} {plural_lessons(total_lessons)}</b>")
+    lines.append("")
+    lines.append("Выбери день ниже:")
+
     lines.append("")
 
     for day in days:
-        lines.append(format_week_day_compact(day))
-        lines.append("")
+        lines.append(format_week_day_line(day))
 
-    text = "\n".join(lines).strip()
-
-    return split_long_message(text)
+    return "\n".join(lines), days
 
 
 # ==========================
-# ДЕЛЕНИЕ СООБЩЕНИЙ
+# ОБРАБОТЧИКИ ЭКРАНОВ
 # ==========================
 
-def limit_message(text: str) -> str:
-    if len(text) <= 3900:
-        return text
+async def show_start(update: Update, context: ContextTypes.DEFAULT_TYPE, edit: bool = False):
+    text = (
+        "Бот расписания ВГЭК ✅\n\n"
+        "Выбери действие:\n\n"
+        "📌 Сегодня — подробное расписание\n"
+        "➡️ Завтра — подробное расписание\n"
+        "📅 Неделя — обзор и кнопки дней\n\n"
+        f"Группа: <b>{DEFAULT_GROUP}</b>"
+    )
 
-    return text[:3900] + "\n\n…обрезал, потому что сообщение слишком длинное."
+    if edit:
+        await edit_screen(update, context, text, reply_markup=main_keyboard())
+    else:
+        await send_new_screen(update, context, text, reply_markup=main_keyboard())
 
 
-def split_long_message(text: str, limit: int = 3600):
-    if len(text) <= limit:
-        return [text]
+async def show_today(update: Update, context: ContextTypes.DEFAULT_TYPE, edit: bool = True):
+    try:
+        schedule = parse_group_schedule(DEFAULT_GROUP)
+        day, target_str = get_day_by_offset(schedule, 0)
 
-    parts = []
-    current = ""
+        context.user_data["last_view"] = "today"
 
-    blocks = text.split("\n\n")
-
-    for block in blocks:
-        if len(current) + len(block) + 2 > limit:
-            if current.strip():
-                parts.append(current.strip())
-            current = block
+        if day:
+            text = format_day_detailed(schedule, day, "📌 <b>Сегодня</b>")
         else:
-            if current:
-                current += "\n\n" + block
-            else:
-                current = block
+            text = (
+                "📌 <b>Сегодня</b>\n"
+                f"{get_updated_line(schedule)}\n\n"
+                f"Не нашёл расписание на {target_str}."
+            )
 
-    if current.strip():
-        parts.append(current.strip())
+    except Exception as error:
+        text = f"❌ Ошибка:\n{escape_html_text(error)}"
 
-    return parts
+    if edit:
+        await edit_screen(update, context, text, reply_markup=day_keyboard())
+    else:
+        await send_new_screen(update, context, text, reply_markup=day_keyboard())
+
+
+async def show_tomorrow(update: Update, context: ContextTypes.DEFAULT_TYPE, edit: bool = True):
+    try:
+        schedule = parse_group_schedule(DEFAULT_GROUP)
+        day, target_str = get_day_by_offset(schedule, 1)
+
+        context.user_data["last_view"] = "tomorrow"
+
+        if day:
+            text = format_day_detailed(schedule, day, "➡️ <b>Завтра</b>")
+        else:
+            text = (
+                "➡️ <b>Завтра</b>\n"
+                f"{get_updated_line(schedule)}\n\n"
+                f"Не нашёл расписание на {target_str}."
+            )
+
+    except Exception as error:
+        text = f"❌ Ошибка:\n{escape_html_text(error)}"
+
+    if edit:
+        await edit_screen(update, context, text, reply_markup=day_keyboard())
+    else:
+        await send_new_screen(update, context, text, reply_markup=day_keyboard())
+
+
+async def show_week(update: Update, context: ContextTypes.DEFAULT_TYPE, edit: bool = True):
+    try:
+        schedule = parse_group_schedule(DEFAULT_GROUP)
+        text, days = format_week_overview(schedule)
+
+        context.user_data["last_view"] = "week"
+
+        markup = week_keyboard(days)
+
+    except Exception as error:
+        text = f"❌ Ошибка:\n{escape_html_text(error)}"
+        markup = main_keyboard()
+
+    if edit:
+        await edit_screen(update, context, text, reply_markup=markup)
+    else:
+        await send_new_screen(update, context, text, reply_markup=markup)
+
+
+async def show_specific_day(update: Update, context: ContextTypes.DEFAULT_TYPE, date_str: str):
+    try:
+        schedule = parse_group_schedule(DEFAULT_GROUP)
+        day = find_day_by_date(schedule, date_str)
+
+        context.user_data["last_view"] = "day"
+        context.user_data["last_date"] = date_str
+
+        if day:
+            day_label = get_day_label(day)
+            date_short = pretty_short_date(day["date"])
+            title = f"📅 <b>{day_label} · {date_short}</b>"
+            text = format_day_detailed(schedule, day, title)
+        else:
+            text = (
+                f"📅 <b>{escape_html_text(date_str)}</b>\n"
+                f"{get_updated_line(schedule)}\n\n"
+                "Расписание на этот день не найдено."
+            )
+
+    except Exception as error:
+        text = f"❌ Ошибка:\n{escape_html_text(error)}"
+
+    await edit_screen(update, context, text, reply_markup=day_keyboard())
+
+
+async def refresh_current(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    last_view = context.user_data.get("last_view", "today")
+
+    if last_view == "today":
+        await show_today(update, context, edit=True)
+        return
+
+    if last_view == "tomorrow":
+        await show_tomorrow(update, context, edit=True)
+        return
+
+    if last_view == "week":
+        await show_week(update, context, edit=True)
+        return
+
+    if last_view == "day":
+        date_str = context.user_data.get("last_date")
+        if date_str:
+            await show_specific_day(update, context, date_str)
+            return
+
+    await show_today(update, context, edit=True)
 
 
 # ==========================
-# TELEGRAM-КОМАНДЫ
+# TELEGRAM HANDLERS
 # ==========================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await prepare_clean_response(update, context)
+    await show_start(update, context, edit=False)
 
-    await send_tracked_message(
+
+async def today_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await show_today(update, context, edit=False)
+
+
+async def tomorrow_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await show_tomorrow(update, context, edit=False)
+
+
+async def week_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await show_week(update, context, edit=False)
+
+
+async def group_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await send_new_screen(
         update,
         context,
-        "Бот живой ✅\n\n"
-        "Выбери кнопку ниже:\n\n"
-        "📌 Сегодня — подробное расписание\n"
-        "➡️ Завтра — подробное расписание\n"
-        "📅 Неделя — краткий обзор ближайших 7 дней\n"
-        "🔄 Обновить — обновить сегодня\n\n"
-        f"Группа по умолчанию: {DEFAULT_GROUP}",
-        reply_markup=MAIN_KEYBOARD
+        "Сейчас бот настроен на группу "
+        f"<b>{DEFAULT_GROUP}</b>.\n\n"
+        "Выбор другой группы добавим позже.",
+        reply_markup=main_keyboard(),
     )
 
 
-async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await prepare_clean_response(update, context)
+async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
 
-    await send_tracked_message(
-        update,
-        context,
-        "pong ✅",
-        reply_markup=MAIN_KEYBOARD
-    )
+    data = query.data
 
-
-async def today(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await prepare_clean_response(update, context)
-
-    loading = await send_tracked_message(
-        update,
-        context,
-        "Загружаю сегодня…",
-        reply_markup=MAIN_KEYBOARD
-    )
-
-    try:
-        schedule = parse_group_schedule(DEFAULT_GROUP)
-        result = format_day_by_offset(schedule, 0)
-    except Exception as error:
-        result = f"❌ Ошибка:\n{escape_html_text(error)}"
-
-    try:
-        await context.bot.delete_message(
-            chat_id=update.effective_chat.id,
-            message_id=loading.message_id
-        )
-        LAST_MESSAGES_BY_CHAT[update.effective_chat.id].remove(loading.message_id)
-    except Exception:
-        pass
-
-    await send_tracked_message(
-        update,
-        context,
-        result,
-        parse_mode="HTML",
-        reply_markup=MAIN_KEYBOARD
-    )
-
-
-async def tomorrow(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await prepare_clean_response(update, context)
-
-    loading = await send_tracked_message(
-        update,
-        context,
-        "Загружаю завтра…",
-        reply_markup=MAIN_KEYBOARD
-    )
-
-    try:
-        schedule = parse_group_schedule(DEFAULT_GROUP)
-        result = format_day_by_offset(schedule, 1)
-    except Exception as error:
-        result = f"❌ Ошибка:\n{escape_html_text(error)}"
-
-    try:
-        await context.bot.delete_message(
-            chat_id=update.effective_chat.id,
-            message_id=loading.message_id
-        )
-        LAST_MESSAGES_BY_CHAT[update.effective_chat.id].remove(loading.message_id)
-    except Exception:
-        pass
-
-    await send_tracked_message(
-        update,
-        context,
-        result,
-        parse_mode="HTML",
-        reply_markup=MAIN_KEYBOARD
-    )
-
-
-async def week(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await prepare_clean_response(update, context)
-
-    loading = await send_tracked_message(
-        update,
-        context,
-        "Собираю краткий обзор недели…",
-        reply_markup=MAIN_KEYBOARD
-    )
-
-    try:
-        schedule = parse_group_schedule(DEFAULT_GROUP)
-        messages = format_week(schedule)
-    except Exception as error:
-        messages = [f"❌ Ошибка:\n{escape_html_text(error)}"]
-
-    try:
-        await context.bot.delete_message(
-            chat_id=update.effective_chat.id,
-            message_id=loading.message_id
-        )
-        LAST_MESSAGES_BY_CHAT[update.effective_chat.id].remove(loading.message_id)
-    except Exception:
-        pass
-
-    for message in messages:
-        await send_tracked_message(
-            update,
-            context,
-            message,
-            parse_mode="HTML",
-            reply_markup=MAIN_KEYBOARD
-        )
-
-
-async def group(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await prepare_clean_response(update, context)
-
-    if not context.args:
-        await send_tracked_message(
-            update,
-            context,
-            "Напиши группу после команды. Например:\n/group Д-12",
-            reply_markup=MAIN_KEYBOARD
-        )
+    if data == "today":
+        await show_today(update, context, edit=True)
         return
 
-    group_name = " ".join(context.args).strip()
+    if data == "tomorrow":
+        await show_tomorrow(update, context, edit=True)
+        return
 
-    loading = await send_tracked_message(
+    if data == "week":
+        await show_week(update, context, edit=True)
+        return
+
+    if data == "refresh":
+        await refresh_current(update, context)
+        return
+
+    if data.startswith("day:"):
+        date_str = data.replace("day:", "", 1)
+        await show_specific_day(update, context, date_str)
+        return
+
+    await show_start(update, context, edit=True)
+
+
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await send_new_screen(
         update,
         context,
-        f"Ищу расписание группы {group_name}…",
-        reply_markup=MAIN_KEYBOARD
-    )
-
-    try:
-        schedule = parse_group_schedule(group_name)
-        messages = format_week(schedule)
-    except Exception as error:
-        messages = [f"❌ Ошибка:\n{escape_html_text(error)}"]
-
-    try:
-        await context.bot.delete_message(
-            chat_id=update.effective_chat.id,
-            message_id=loading.message_id
-        )
-        LAST_MESSAGES_BY_CHAT[update.effective_chat.id].remove(loading.message_id)
-    except Exception:
-        pass
-
-    for message in messages:
-        await send_tracked_message(
-            update,
-            context,
-            message,
-            parse_mode="HTML",
-            reply_markup=MAIN_KEYBOARD
-        )
-
-
-async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text
-
-    if text == "📌 Сегодня":
-        await today(update, context)
-        return
-
-    if text == "➡️ Завтра":
-        await tomorrow(update, context)
-        return
-
-    if text == "📅 Неделя":
-        await week(update, context)
-        return
-
-    if text == "🔄 Обновить":
-        await today(update, context)
-        return
-
-    await prepare_clean_response(update, context)
-
-    await send_tracked_message(
-        update,
-        context,
-        "Не понял сообщение. Используй кнопки ниже 👇",
-        reply_markup=MAIN_KEYBOARD
+        "Используй кнопки под сообщением 👇",
+        reply_markup=main_keyboard(),
     )
 
 
@@ -940,17 +997,17 @@ def main():
     )
 
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("ping", ping))
-    app.add_handler(CommandHandler("today", today))
-    app.add_handler(CommandHandler("tomorrow", tomorrow))
-    app.add_handler(CommandHandler("week", week))
-    app.add_handler(CommandHandler("group", group))
+    app.add_handler(CommandHandler("today", today_command))
+    app.add_handler(CommandHandler("tomorrow", tomorrow_command))
+    app.add_handler(CommandHandler("week", week_command))
+    app.add_handler(CommandHandler("group", group_command))
 
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_button))
+    app.add_handler(CallbackQueryHandler(handle_callback))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
     app.add_error_handler(error_handler)
 
-    print("Бот запущен. Напиши /start в Telegram")
+    print("Бот запущен.")
     app.run_polling(drop_pending_updates=True)
 
 
